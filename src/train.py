@@ -1,119 +1,121 @@
-import argparse, os, json, joblib
+import os
+import argparse
+import joblib
 import pandas as pd
-import numpy as np
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import numpy as np 
+import lightgbm as lgb
+import json
 from sklearn.model_selection import train_test_split
-from sklearn.feature_selection import VarianceThreshold
-from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from tqdm import tqdm
 
-try:
-    from xgboost import XGBRegressor
-    HAS_XGB = True
-except Exception:
-    HAS_XGB = False
+def load_and_clean(csv_path: str):
+    df = pd.read_csv(csv_path)
 
-from utils import load_and_align, split_features_target
+    # Ensure correct column names
+    expected_target = "Yield"
+    if expected_target not in df.columns:
+        raise ValueError(f"Dataset must contain '{expected_target}' column. Found: {df.columns.tolist()}")
 
+    # Features = everything except target
+    X = df.drop(columns=[expected_target])
+    y = df[expected_target]
+
+    # Convert categoricals → category dtype
+    for col in ["Crop", "Season", "State"]:
+        if col in X.columns:
+            X[col] = X[col].astype("category")
+
+    return X, y
 
 def main(args):
-    df = load_and_align(args.data)
-    X, y, cat_cols, num_cols = split_features_target(df)
+    print("📂 Loading dataset...")
+    X, y = load_and_clean(args.data)
 
-    if y is None:
-        raise ValueError("Dataset must contain a 'Yield' column for training.")
-
-    # --- Preprocess: numeric + categorical ---
-    num_pipeline = Pipeline(steps=[
-        ("imp", SimpleImputer(strategy="median")),
-        ("var", VarianceThreshold(threshold=0.0)),
-        ("sc", StandardScaler())
-    ])
-    cat_pipeline = Pipeline(steps=[
-        ("imp", SimpleImputer(strategy="most_frequent")),
-        ("oh", OneHotEncoder(handle_unknown="ignore"))
-    ])
-
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", num_pipeline, num_cols),
-            ("cat", cat_pipeline, cat_cols),
-        ],
-        remainder="drop"
-    )
-
-    # --- Model ---
-    model = LGBMRegressor(
-        n_estimators=2000,        # huge, but early stopping will cut it
-        learning_rate=0.01,
-        max_depth=6,               # unlimited depth, use num_leaves to control
-        num_leaves=256,             # bigger trees (default 31 is too small)
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        device="gpu",               # <<< THIS is key
-        gpu_platform_id=0,
-        gpu_device_id=0,
-        random_state=42,
-        n_jobs=-1
-    )
-        
-    if args.model == "xgb" and HAS_XGB:
-        model = XGBRegressor(
-            n_estimators=20000,         # high, let early stopping decide
-            learning_rate=0.01,
-            max_depth=12,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            tree_method="gpu_hist",      # <<< GPU
-            predictor="gpu_predictor",   # <<< GPU
-            gpu_id=0,
-            random_state=42,
-            verbosity=1
-    )
-
-    pipe = Pipeline([("pre", pre), ("model", model)])
-
-    # --- Train/val split ---
+    # Split train/validation
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
-    pipe.fit(X_train, y_train)
 
-    # --- Evaluation ---
-    preds = pipe.predict(X_val)
-    mse = mean_squared_error(y_val, preds)
-    rmse = float(np.sqrt(mse))
-    mae = float(mean_absolute_error(y_val, preds))
-    r2 = float(r2_score(y_val, preds))
+    # LightGBM Dataset
+    lgb_train = lgb.Dataset(
+        X_train, y_train, categorical_feature=["Crop", "Season", "State"]
+    )
+    lgb_val = lgb.Dataset(
+        X_val, y_val, reference=lgb_train, categorical_feature=["Crop", "Season", "State"]
+    )
 
-    # --- Save artifacts ---
-    os.makedirs(args.outdir, exist_ok=True)
-    joblib.dump(pipe, os.path.join(args.outdir, "model.pkl"))
-    meta = {
-        "features": list(X.columns),
-        "cat_cols": cat_cols,
-        "num_cols": num_cols,
-        "metrics": {"rmse": rmse, "mae": mae, "r2": r2}
+    # Params
+    params = {
+        "objective": "poisson",
+        "metric": "rmse",
+        "n_estimators": 10000,
+        "learning_rate": 0.01,
+        "max_depth": 2,
+        "num_leaves": 256,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "random_state": 42,
+        "n_jobs": -1,
+        "device": "gpu" if args.gpu else "cpu"
     }
-    with open(os.path.join(args.outdir, "feature_list.json"), "w") as f:
-        json.dump(meta, f, indent=2)
 
-    print(f"Saved model to {args.outdir}. Metrics => RMSE: {rmse:.3f}, MAE: {mae:.3f}, R2: {r2:.3f}")
+    # Custom callback to update tqdm progress bar
+    pbar = tqdm(total=params["n_estimators"], desc="🚀 Training Progress")
 
+    def tqdm_callback(env):
+        pbar.update(1)
+        if env.iteration == params["n_estimators"] - 1:
+            pbar.close()
+
+    print("⚡ Training LightGBM model...")
+    model = lgb.train(
+        params,
+        lgb_train,
+        valid_sets=[lgb_train, lgb_val],
+        valid_names=["train", "valid"],
+        callbacks=[lgb.early_stopping(100), tqdm_callback]
+    )
+
+    # Predictions
+    y_pred = model.predict(X_val, num_iteration=model.best_iteration)
+    y_pred = np.maximum(y_pred, 0)
+    rmse = mean_squared_error(y_val, y_pred) ** 0.5
+    r2 = r2_score(y_val, y_pred)
+
+    print(f"✅ Training complete. RMSE: {rmse:.4f}, R²: {r2:.4f}")
+
+    # Save model + metadata
+    os.makedirs(args.outdir, exist_ok=True)
+    model_path = os.path.join(args.outdir, "crop_yield_model.pkl")
+    feature_list_path = os.path.join(args.outdir, "feature_list.json")
+    categories_path = os.path.join(args.outdir, "categories.json")
+
+    joblib.dump(model, model_path)
+
+    # Save features
+    with open(feature_list_path, "w") as f:
+        json.dump({"features": list(X.columns)}, f, indent=4)
+
+    # Save categorical levels
+    categories = {}
+    for col in ["Crop", "Season", "State"]:
+        if col in X.columns and pd.api.types.is_categorical_dtype(X[col]):
+            categories[col] = X[col].cat.categories.tolist()
+
+    with open(categories_path, "w") as f:
+        json.dump(categories, f, indent=4)
+
+    print(f"📦 Model saved to: {model_path}")
+    print(f"📝 Feature list saved to: {feature_list_path}")
+    print(f"📝 Categories saved to: {categories_path}")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="Path to training CSV")
-    ap.add_argument("--outdir", default="models", help="Output directory")
-    ap.add_argument("--n_estimators", type=int, default=800)
-    ap.add_argument("--lr", type=float, default=0.05)
-    ap.add_argument("--model", choices=["lgbm", "xgb"], default="lgbm")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, required=True, help="Path to dataset CSV")
+    parser.add_argument("--outdir", type=str, required=True, help="Directory to save model")
+    parser.add_argument("--gpu", action="store_true", help="Use GPU if available")
+    args = parser.parse_args()
     main(args)

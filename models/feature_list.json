@@ -1,31 +1,13 @@
 {
-  "features": [
-    "Crop",
-    "Crop_Year",
-    "Season",
-    "State",
-    "Area",
-    "Production",
-    "Annual_Rainfall",
-    "Fertilizer",
-    "Pesticide"
-  ],
-  "cat_cols": [
-    "Crop",
-    "Season",
-    "State"
-  ],
-  "num_cols": [
-    "Crop_Year",
-    "Area",
-    "Production",
-    "Annual_Rainfall",
-    "Fertilizer",
-    "Pesticide"
-  ],
-  "metrics": {
-    "rmse": 232.88454311721017,
-    "mae": 17.296718906108865,
-    "r2": 0.9323108936558879
-  }
+    "features": [
+        "Crop",
+        "Crop_Year",
+        "Season",
+        "State",
+        "Area",
+        "Production",
+        "Annual_Rainfall",
+        "Fertilizer",
+        "Pesticide"
+    ]
 }
