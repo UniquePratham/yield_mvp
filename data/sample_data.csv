@@ -1,0 +1,5 @@
+region,crop,year,rainfall,tmin,tmax,ndvi,soil_ph,soil_n,soil_p,soil_k,yield
+Punjab,Wheat,2018,420,8.0,30.0,0.42,6.7,55,35,75,3200
+Punjab,Wheat,2019,510,9.1,31.2,0.47,6.8,60,40,80,3350
+Punjab,Wheat,2020,470,8.5,29.8,0.45,6.9,58,37,78,3300
+Punjab,Wheat,2021,490,9.0,30.5,0.46,6.8,62,42,82,3400
