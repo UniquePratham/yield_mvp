@@ -1,44 +1,95 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import joblib, os
-import pandas as pd
-import numpy as np
 import json
+import pickle
+import pandas as pd
+from flask import Flask, request, jsonify
+from flask_cors import CORS   # ✅ Enable CORS
 
-MODEL_PATH = os.getenv("MODEL_PATH", "models/model.pkl")
-FEATURE_META_PATH = os.getenv("FEATURE_META_PATH", "models/feature_list.json")
+# -----------------------------
+# Load model and metadata
+# -----------------------------
+with open("models/crop_yield_model.pkl", "rb") as f:
+    model = pickle.load(f)
 
-model = joblib.load(MODEL_PATH)
-with open(FEATURE_META_PATH) as f:
-    meta = json.load(f)
-expected_features = meta["features"]
+with open("models/categories.json", "r") as f:
+    categories = json.load(f)
 
-class Payload(BaseModel):
-    Crop: str
-    Crop_Year: int
-    Season: str
-    State: str
-    Area: float
-    Production: float
-    Annual_Rainfall: float
-    Fertilizer: float
-    Pesticide: float
+with open("models/feature_list.json", "r") as f:
+    _fl = json.load(f)
+    if isinstance(_fl, dict) and "features" in _fl:
+        feature_list = _fl["features"]
+    elif isinstance(_fl, list):
+        feature_list = _fl
+    else:
+        feature_list = list(_fl)
 
-app = FastAPI(title="Yield Predictor API")
+# -----------------------------
+# Flask App
+# -----------------------------
+app = Flask(__name__)
+CORS(app)  # ✅ allow all origins
 
-@app.get("/health")
+# -----------------------------
+# Helper functions
+# -----------------------------
+def _map_to_saved_category(val, saved_cats):
+    """Match val with saved category (ignoring whitespace).
+       If no match, return None."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    for cat in saved_cats:
+        if str(cat).strip() == s:
+            return cat
+    if val in saved_cats:
+        return val
+    return None
+
+def preprocess_input(data):
+    """Convert JSON input to DataFrame compatible with the model."""
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise ValueError("Input must be a dict (single row) or list of dicts.")
+
+    df = pd.DataFrame(data)
+
+    # Handle categorical features
+    for col, cats in categories.items():
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _map_to_saved_category(v, cats))
+            df[col] = pd.Categorical(df[col], categories=cats)
+        else:
+            df[col] = pd.Categorical([None] * len(df), categories=cats)
+
+    # Ensure all features exist
+    for feat in feature_list:
+        if feat not in df.columns:
+            df[feat] = 0
+
+    df = df[feature_list]
+    return df
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"})
 
-@app.post("/predict")
-def predict(p: Payload):
-    df = pd.DataFrame([p.dict()])
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        input_data = request.get_json(force=True)
+        df = preprocess_input(input_data)
+        preds = model.predict(df)
 
-    # Align columns
-    for col in expected_features:
-        if col not in df.columns:
-            df[col] = np.nan
-    df = df[expected_features]
+        results = [{"Yield": float(p)} for p in preds]
+        return jsonify(results if len(results) > 1 else results[0])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
-    y = model.predict(df)[0]
-    return {"yield_pred": float(y)}
+# -----------------------------
+# Run server
+# -----------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
